@@ -1,24 +1,55 @@
-import React, { useState, useEffect, useMemo, useCallback } from "react";
-import {
-  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend,
-} from "recharts";
-import {
-  CheckCircle2, Circle, Clock, Ban, ChevronDown, ChevronRight, ChevronLeft, Star, Trophy,
-  Video, Calendar, Users, TrendingUp, MessageCircle, Send, Pin, Heart, PartyPopper,
-  Lightbulb, Link as LinkIcon, X, Settings2, Target, ListChecks, Layers, PackageCheck,
-  Sparkles, Award, Rocket, ClipboardList, ArrowRight, Pencil, Trash2, Reply as ReplyIcon,
-  CalendarClock, Flag, AlertTriangle,
-} from "lucide-react";
+import React, { useState, useEffect } from "react";
+import { supabase } from "./lib/supabase";
 
-/* ============================== RAW SEED DATA ============================== */
-
-const RAW_WEEKS = [ /* seed data omitted for brevity; loaded from original file */ ];
+/* Optional local fallback data (keeps UI functional if DB is empty) */
+const RAW_WEEKS: any[] = [];
 
 export default function HawkimTrack() {
+  const [weeks, setWeeks] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let mounted = true;
+
+    async function load() {
+      setLoading(true);
+      try {
+        // try to read from a table named `weeks` (adjust to your schema)
+        const { data, error } = await supabase.from("weeks").select("*");
+        if (error) throw error;
+        if (mounted && data && data.length > 0) setWeeks(data as any[]);
+        else if (mounted) setWeeks(RAW_WEEKS);
+      } catch (err) {
+        console.error("Supabase fetch error:", err);
+        if (mounted) setWeeks(RAW_WEEKS);
+      } finally {
+        if (mounted) setLoading(false);
+      }
+    }
+
+    load();
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
   return (
-    <div className="p-10">
-      <h1 className="text-2xl font-bold">Hawkim Track (Prototype)</h1>
-      <p className="mt-2 text-sm text-slate-600">Open the original single-file prototype at the workspace root: hawkim-track.jsx</p>
+    <div className="p-6">
+      <h1 className="text-2xl font-bold mb-4">Hawkim Track</h1>
+      {loading ? (
+        <p className="text-sm text-slate-600">Loading data...</p>
+      ) : weeks.length === 0 ? (
+        <p className="text-sm text-slate-600">No data found. Add rows to the `weeks` table in Supabase.</p>
+      ) : (
+        <ul className="space-y-2">
+          {weeks.map((w: any, i: number) => (
+            <li key={w.id ?? i} className="p-2 border rounded">
+              <strong>{w.title ?? `Week ${i + 1}`}</strong>
+              <div className="text-sm text-slate-600">{w.summary ?? JSON.stringify(w)}</div>
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }
