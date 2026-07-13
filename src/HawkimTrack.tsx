@@ -1,3 +1,3 @@
-import React from 'react'
-import HawkimTrack from './hawkim-track'
-export default HawkimTrack
+import HawkimTrack from "./hawkim-track.jsx";
+
+export default HawkimTrack;
