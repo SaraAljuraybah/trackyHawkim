@@ -9,6 +9,7 @@ import {
   Sparkles, Award, Rocket, ClipboardList, ArrowRight, Pencil, Trash2, Reply as ReplyIcon,
   CalendarClock, Flag, AlertTriangle,
 } from "lucide-react";
+import { supabase } from "./lib/supabase";
 
 /* ============================== RAW SEED DATA ============================== */
 
@@ -355,20 +356,65 @@ function saveLS(key, value) {
 
 const LS_KEYS = {
   tasks: "hawkim_task_overrides_v1",
-  pulse: "hawkim_pulse_v1",
   stars: "hawkim_weekly_stars_v1",
   reviews: "hawkim_weekly_reviews_v1",
   simDate: "hawkim_sim_date_v1",
   meeting: "hawkim_meeting_v1",
 };
 
-const SEED_PULSE = [
-  { id: "p1", memberId: "m1", text: "ترا خلصت بيبر ولخصتها لكم بملف الوورد 📄", ts: Date.now() - 1000 * 60 * 60 * 5, reactions: { "👍": ["m2"], "🎉": [] }, replies: [], pinned: false },
-  { id: "p2", memberId: "m3", text: "I just added a paper to the document folder. Check it out!", ts: Date.now() - 1000 * 60 * 60 * 3, reactions: { "👍": ["m1", "m4"], "🎉": [] }, replies: [
-    { id: "r1", memberId: "m1", text: "أشوفه الحين، شكراً!", ts: Date.now() - 1000 * 60 * 60 * 2 },
-  ], pinned: false },
-  { id: "p3", memberId: "m4", text: "أرسلت إيميلات للشركات اليوم 📬", ts: Date.now() - 1000 * 60 * 30, reactions: { "👍": [], "🎉": [] }, replies: [], pinned: false },
-];
+function dbCommentToPost(comment, fallbackMemberId = MEMBERS[0].id) {
+  const memberName = comment.team_members?.name;
+  const localMember = MEMBERS.find((m) => m.name.toLowerCase() === memberName?.toLowerCase());
+  return {
+    id: comment.id,
+    memberId: localMember?.id ?? fallbackMemberId,
+    memberUuid: comment.member_id ?? comment.team_members?.id ?? null,
+    text: comment.content ?? "",
+    ts: comment.created_at ? new Date(comment.created_at).getTime() : Date.now(),
+    reactions: { "👍": [], "🎉": [] },
+    replies: [],
+    pinned: false,
+  };
+}
+
+async function loadCommentsFromSupabase() {
+  const { data, error } = await supabase
+    .from("comments")
+    .select(`
+      *,
+      team_members (
+        id,
+        name
+      )
+    `)
+    .order("created_at", { ascending: false });
+
+  if (error) {
+    console.error("Supabase comments load failed:", {
+      message: error.message,
+      details: error.details,
+      hint: error.hint,
+      code: error.code
+    });
+    return [];
+  }
+
+  return (data ?? []).map((comment) => dbCommentToPost(comment));
+}
+
+function findSupabaseWeekId(week, supabaseWeeks) {
+  if (!week) return null;
+  const match = supabaseWeeks.find((row) => (
+    row.week_number === week.weekNumber ||
+    row.weekNumber === week.weekNumber ||
+    row.number === week.weekNumber ||
+    row.name === `Week ${week.weekNumber}` ||
+    row.title === `Week ${week.weekNumber}` ||
+    row.start === week.start.toISOString().slice(0, 10) ||
+    row.start_date === week.start.toISOString().slice(0, 10)
+  ));
+  return match?.id ?? null;
+}
 
 /* ============================== SMALL UI ATOMS ============================== */
 
@@ -689,18 +735,47 @@ function timeAgo(ts) {
   return `${Math.floor(hr / 24)}d ago`;
 }
 
-function TeamPulse({ posts, setPosts, currentMemberId, setCurrentMemberId }) {
+function TeamPulse({ posts, setPosts, currentMemberId, setCurrentMemberId, currentWeekId, memberIdByLocalId, reloadComments }) {
   const [text, setText] = useState("");
   const [replyingTo, setReplyingTo] = useState(null);
   const [replyText, setReplyText] = useState("");
 
   const sorted = [...posts].sort((a, b) => (b.pinned - a.pinned) || (b.ts - a.ts));
 
-  function post() {
-    if (!text.trim()) return;
-    const newPost = { id: `p${Date.now()}`, memberId: currentMemberId, text: text.trim(), ts: Date.now(), reactions: { "👍": [], "🎉": [] }, replies: [], pinned: false };
-    setPosts([newPost, ...posts]);
+  async function post(event) {
+    event?.preventDefault();
+    const commentText = text.trim();
+    if (!commentText) return;
+
+    const selectedMemberId = memberIdByLocalId[currentMemberId] ?? null;
+    const selectedTaskId = null;
+
+    const { data, error } = await supabase
+      .from("comments")
+      .insert({
+        content: commentText,
+        member_id: selectedMemberId || null,
+        week_id: currentWeekId || null,
+        task_id: selectedTaskId || null
+      })
+      .select()
+      .single();
+
+    if (error) {
+      console.error("Supabase comment insert failed:", {
+        message: error.message,
+        details: error.details,
+        hint: error.hint,
+        code: error.code
+      });
+
+      alert(`Comment was not saved: ${error.message}`);
+      return;
+    }
+
+    console.log("Comment saved successfully:", data);
     setText("");
+    await reloadComments();
   }
   function react(postId, emoji) {
     setPosts(posts.map((p) => {
@@ -713,8 +788,19 @@ function TeamPulse({ posts, setPosts, currentMemberId, setCurrentMemberId }) {
   function togglePin(postId) {
     setPosts(posts.map((p) => (p.id === postId ? { ...p, pinned: !p.pinned } : p)));
   }
-  function removePost(postId) {
-    setPosts(posts.filter((p) => p.id !== postId));
+  async function removePost(postId) {
+    const { error } = await supabase.from("comments").delete().eq("id", postId);
+    if (error) {
+      console.error("Supabase comment delete failed:", {
+        message: error.message,
+        details: error.details,
+        hint: error.hint,
+        code: error.code
+      });
+      alert(`Comment was not deleted: ${error.message}`);
+      return;
+    }
+    await reloadComments();
   }
   function submitReply(postId) {
     if (!replyText.trim()) return;
@@ -806,11 +892,15 @@ function TeamPulse({ posts, setPosts, currentMemberId, setCurrentMemberId }) {
           dir="auto"
           value={text}
           onChange={(e) => setText(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && post()}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              post(e);
+            }
+          }}
           placeholder="Share a quick update..."
           className="flex-1 text-sm rounded-xl border border-slate-200 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-teal-200"
         />
-        <button onClick={post} className="rounded-xl p-2 text-white flex-shrink-0" style={{ background: "#0D9488" }}>
+        <button type="button" onClick={post} className="rounded-xl p-2 text-white flex-shrink-0" style={{ background: "#0D9488" }}>
           <Send size={16} />
         </button>
       </div>
@@ -1178,28 +1268,107 @@ export default function HawkimTrack() {
   const weeks = useMemo(() => buildWeeks(), []);
   const [activeTab, setActiveTab] = useState("Week Plan");
   const [taskOverrides, setTaskOverrides] = useState(() => loadLS(LS_KEYS.tasks, {}));
-  const [pulsePosts, setPulsePosts] = useState(() => loadLS(LS_KEYS.pulse, SEED_PULSE));
+  const [pulsePosts, setPulsePosts] = useState([]);
   const [currentMemberId, setCurrentMemberId] = useState(MEMBERS[0].id);
   const [weeklyStars, setWeeklyStars] = useState(() => loadLS(LS_KEYS.stars, {}));
   const [weeklyReviews, setWeeklyReviews] = useState(() => loadLS(LS_KEYS.reviews, {}));
   const [meeting, setMeeting] = useState(() => loadLS(LS_KEYS.meeting, { link: "", when: "Saturday, 6:00 PM", agenda: "" }));
   const [simDate, setSimDate] = useState(() => loadLS(LS_KEYS.simDate, ""));
+  const [supabaseMembers, setSupabaseMembers] = useState([]);
+  const [supabaseWeeks, setSupabaseWeeks] = useState([]);
   const [showDev, setShowDev] = useState(false);
   const [showStarModal, setShowStarModal] = useState(false);
   const [showReviewModal, setShowReviewModal] = useState(false);
   const [celebrate, setCelebrate] = useState(0);
 
   useEffect(() => saveLS(LS_KEYS.tasks, taskOverrides), [taskOverrides]);
-  useEffect(() => saveLS(LS_KEYS.pulse, pulsePosts), [pulsePosts]);
   useEffect(() => saveLS(LS_KEYS.stars, weeklyStars), [weeklyStars]);
   useEffect(() => saveLS(LS_KEYS.reviews, weeklyReviews), [weeklyReviews]);
   useEffect(() => saveLS(LS_KEYS.meeting, meeting), [meeting]);
   useEffect(() => saveLS(LS_KEYS.simDate, simDate), [simDate]);
 
+  const reloadComments = useCallback(async () => {
+    const nextComments = await loadCommentsFromSupabase();
+    setPulsePosts(nextComments);
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+
+    async function loadSupabaseData() {
+      const { data: connectionData, error: connectionError } = await supabase
+        .from("team_members")
+        .select("id, name")
+        .limit(1);
+
+      console.log("Supabase connection test:", { data: connectionData, error: connectionError });
+
+      if (connectionError) {
+        console.error("Supabase connection test failed:", {
+          message: connectionError.message,
+          details: connectionError.details,
+          hint: connectionError.hint,
+          code: connectionError.code
+        });
+      }
+
+      const [membersResult, weeksResult, comments] = await Promise.all([
+        supabase.from("team_members").select("id, name"),
+        supabase.from("weeks").select("*"),
+        loadCommentsFromSupabase()
+      ]);
+
+      if (membersResult.error) {
+        console.error("Supabase team_members load failed:", {
+          message: membersResult.error.message,
+          details: membersResult.error.details,
+          hint: membersResult.error.hint,
+          code: membersResult.error.code
+        });
+      }
+
+      if (weeksResult.error) {
+        console.error("Supabase weeks load failed:", {
+          message: weeksResult.error.message,
+          details: weeksResult.error.details,
+          hint: weeksResult.error.hint,
+          code: weeksResult.error.code
+        });
+      }
+
+      if (!mounted) return;
+      setSupabaseMembers(membersResult.data ?? []);
+      setSupabaseWeeks(weeksResult.data ?? []);
+      setPulsePosts(comments);
+    }
+
+    loadSupabaseData();
+
+    const channel = supabase
+      .channel("public:comments")
+      .on("postgres_changes", { event: "*", schema: "public", table: "comments" }, () => {
+        reloadComments();
+      })
+      .subscribe();
+
+    return () => {
+      mounted = false;
+      supabase.removeChannel(channel);
+    };
+  }, [reloadComments]);
+
   const today = simDate ? new Date(simDate + "T12:00:00") : new Date();
 
   const activeIdx = findActiveWeekIndex(weeks, today);
   const currentWeek = activeIdx >= 0 ? weeks[activeIdx] : null;
+  const currentWeekId = useMemo(() => findSupabaseWeekId(currentWeek, supabaseWeeks), [currentWeek, supabaseWeeks]);
+  const memberIdByLocalId = useMemo(() => {
+    return MEMBERS.reduce((acc, member) => {
+      const dbMember = supabaseMembers.find((row) => row.name?.toLowerCase() === member.name.toLowerCase());
+      acc[member.id] = dbMember?.id ?? null;
+      return acc;
+    }, {});
+  }, [supabaseMembers]);
 
   const overallPct = useMemo(() => {
     let total = 0, done = 0;
@@ -1261,7 +1430,15 @@ export default function HawkimTrack() {
                 ) : (
                   <div className="rounded-2xl bg-white border border-slate-100 p-4 text-xs text-slate-400 italic">No active week to show weekly progress for.</div>
                 )}
-                <TeamPulse posts={pulsePosts} setPosts={setPulsePosts} currentMemberId={currentMemberId} setCurrentMemberId={setCurrentMemberId} />
+                <TeamPulse
+                  posts={pulsePosts}
+                  setPosts={setPulsePosts}
+                  currentMemberId={currentMemberId}
+                  setCurrentMemberId={setCurrentMemberId}
+                  currentWeekId={currentWeekId}
+                  memberIdByLocalId={memberIdByLocalId}
+                  reloadComments={reloadComments}
+                />
               </div>
             </div>
           </div>

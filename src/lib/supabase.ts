@@ -4,6 +4,9 @@ const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
 const supabasePublishableKey =
   import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
 
+console.log("Supabase URL configured:", Boolean(import.meta.env.VITE_SUPABASE_URL));
+console.log("Supabase key configured:", Boolean(import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY));
+
 if (!supabaseUrl || !supabasePublishableKey) {
   throw new Error(
     "Missing Supabase environment variables. Check VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY."
