@@ -355,30 +355,220 @@ function saveLS(key, value) {
 }
 
 const LS_KEYS = {
-  tasks: "hawkim_task_overrides_v1",
-  stars: "hawkim_weekly_stars_v1",
-  reviews: "hawkim_weekly_reviews_v1",
   simDate: "hawkim_sim_date_v1",
-  meeting: "hawkim_meeting_v1",
 };
 
-function dbCommentToPost(comment, fallbackMemberId = MEMBERS[0].id) {
+const TASK_KIND_SORT_OFFSET = { tasks: 1000, parallel: 2000, deliverables: 3000 };
+const TASK_KIND_FROM_OFFSET = [
+  ["deliverables", TASK_KIND_SORT_OFFSET.deliverables],
+  ["parallelTasks", TASK_KIND_SORT_OFFSET.parallel],
+  ["tasks", TASK_KIND_SORT_OFFSET.tasks],
+];
+
+const UI_TO_DB_STATUS = {
+  "Not Started": "not_started",
+  "In Progress": "in_progress",
+  Completed: "completed",
+  Blocked: "blocked",
+};
+
+const DB_TO_UI_STATUS = {
+  not_started: "Not Started",
+  "Not Started": "Not Started",
+  in_progress: "In Progress",
+  "In Progress": "In Progress",
+  completed: "Completed",
+  Completed: "Completed",
+  blocked: "Blocked",
+  Blocked: "Blocked",
+};
+
+const DEFAULT_MEETING = { link: "", when: "Saturday, 6:00 PM", agenda: "" };
+
+function logSupabaseError(label, error) {
+  console.error(label, {
+    message: error.message,
+    details: error.details,
+    hint: error.hint,
+    code: error.code
+  });
+}
+
+function parseSharedSettings(settings) {
+  if (!settings?.announcement) return {};
+  try {
+    const parsed = JSON.parse(settings.announcement);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function buildSharedSettingsPayload(sharedSettings, updates) {
+  return JSON.stringify({ ...sharedSettings, ...updates });
+}
+
+function memberUuidToLocalId(memberId, members) {
+  const dbMember = members.find((m) => m.id === memberId);
+  const localMember = MEMBERS.find((m) => m.name.toLowerCase() === dbMember?.name?.toLowerCase());
+  return localMember?.id ?? MEMBERS[0].id;
+}
+
+function dbStatusToUi(status) {
+  return DB_TO_UI_STATUS[status] ?? "Not Started";
+}
+
+function uiStatusToDb(status) {
+  return UI_TO_DB_STATUS[status] ?? "not_started";
+}
+
+function taskKindFromSortOrder(sortOrder) {
+  const numeric = Number(sortOrder ?? 0);
+  const match = TASK_KIND_FROM_OFFSET.find(([, offset]) => numeric >= offset);
+  return match?.[0] ?? "tasks";
+}
+
+function taskWeightForKind(kind) {
+  if (kind === "deliverables") return WEIGHTS.deliverable;
+  if (kind === "parallelTasks") return WEIGHTS.parallel;
+  return WEIGHTS.task;
+}
+
+function dbTaskToItem(task) {
+  const kind = taskKindFromSortOrder(task.sort_order);
+  return {
+    id: task.id,
+    text: task.title,
+    description: task.description,
+    weight: taskWeightForKind(kind),
+    status: dbStatusToUi(task.status),
+    assignee: null,
+    dueDate: task.due_date,
+    priority: task.priority,
+    sortOrder: task.sort_order ?? 0,
+  };
+}
+
+function mergeDbWeeks(rawWeeks, dbWeeks, dbTasks) {
+  return rawWeeks.map((fallbackWeek) => {
+    const dbWeek = dbWeeks.find((w) => Number(w.week_number) === fallbackWeek.weekNumber);
+    const base = dbWeek ? {
+      ...fallbackWeek,
+      id: dbWeek.id,
+      weekNumber: dbWeek.week_number,
+      start: new Date(`${dbWeek.start_date}T00:00:00`),
+      end: new Date(`${dbWeek.end_date}T23:59:59`),
+      title: dbWeek.title,
+    } : fallbackWeek;
+
+    if (!dbWeek) return base;
+
+    const grouped = { tasks: [], parallelTasks: [], deliverables: [] };
+    dbTasks
+      .filter((task) => task.week_id === dbWeek.id)
+      .sort((a, b) => Number(a.sort_order ?? 0) - Number(b.sort_order ?? 0))
+      .forEach((task) => {
+        const kind = taskKindFromSortOrder(task.sort_order);
+        grouped[kind].push(dbTaskToItem(task));
+      });
+
+    return {
+      ...base,
+      tasks: grouped.tasks,
+      parallelTasks: grouped.parallelTasks,
+      deliverables: grouped.deliverables,
+    };
+  });
+}
+
+async function seedWeeksIfEmpty(existingWeeks, rawWeeks) {
+  if (existingWeeks.length > 0) return existingWeeks;
+  const rows = rawWeeks.map((week) => ({
+    week_number: week.weekNumber,
+    title: `Week ${week.weekNumber}`,
+    start_date: week.start.toISOString().slice(0, 10),
+    end_date: week.end.toISOString().slice(0, 10),
+  }));
+
+  const { data, error } = await supabase
+    .from("weeks")
+    .insert(rows)
+    .select("*");
+
+  if (error) {
+    logSupabaseError("Supabase weeks seed failed:", error);
+    alert(`Weeks were not initialized: ${error.message}`);
+    return existingWeeks;
+  }
+
+  return data ?? [];
+}
+
+async function seedTasksIfEmpty(existingTasks, rawWeeks, dbWeeks) {
+  if (existingTasks.length > 0) return existingTasks;
+
+  const rows = [];
+  rawWeeks.forEach((week) => {
+    const dbWeek = dbWeeks.find((w) => Number(w.week_number) === week.weekNumber);
+    if (!dbWeek) return;
+    [
+      ["tasks", week.tasks, TASK_KIND_SORT_OFFSET.tasks],
+      ["parallelTasks", week.parallelTasks, TASK_KIND_SORT_OFFSET.parallel],
+      ["deliverables", week.deliverables, TASK_KIND_SORT_OFFSET.deliverables],
+    ].forEach(([, items, offset]) => {
+      items.forEach((item, index) => {
+        rows.push({
+          week_id: dbWeek.id,
+          title: item.text,
+          description: null,
+          status: uiStatusToDb(item.status),
+          completed_at: null,
+          due_date: null,
+          priority: "medium",
+          sort_order: offset + index,
+        });
+      });
+    });
+  });
+
+  if (rows.length === 0) return existingTasks;
+
+  const { data, error } = await supabase
+    .from("tasks")
+    .insert(rows)
+    .select("*");
+
+  if (error) {
+    logSupabaseError("Supabase tasks seed failed:", error);
+    alert(`Tasks were not initialized: ${error.message}`);
+    return existingTasks;
+  }
+
+  return data ?? [];
+}
+
+function dbCommentToPost(comment, commentLikes, replies, supabaseMembers, fallbackMemberId = MEMBERS[0].id) {
   const memberName = comment.team_members?.name;
   const localMember = MEMBERS.find((m) => m.name.toLowerCase() === memberName?.toLowerCase());
+  const likedLocalMemberIds = commentLikes
+    .filter((like) => like.comment_id === comment.id)
+    .map((like) => memberUuidToLocalId(like.member_id, supabaseMembers));
+
   return {
     id: comment.id,
     memberId: localMember?.id ?? fallbackMemberId,
     memberUuid: comment.member_id ?? comment.team_members?.id ?? null,
     text: comment.content ?? "",
     ts: comment.created_at ? new Date(comment.created_at).getTime() : Date.now(),
-    reactions: { "👍": [], "🎉": [] },
-    replies: [],
-    pinned: false,
+    reactions: { "👍": likedLocalMemberIds, "🎉": [] },
+    replies,
+    pinned: Boolean(comment.is_pinned),
   };
 }
 
-async function loadCommentsFromSupabase() {
-  const { data, error } = await supabase
+async function loadCommentsFromSupabase(supabaseMembers = []) {
+  const [{ data, error }, likesResult] = await Promise.all([
+    supabase
     .from("comments")
     .select(`
       *,
@@ -387,33 +577,38 @@ async function loadCommentsFromSupabase() {
         name
       )
     `)
-    .order("created_at", { ascending: false });
+      .order("created_at", { ascending: false }),
+    supabase.from("comment_likes").select("*")
+  ]);
 
   if (error) {
-    console.error("Supabase comments load failed:", {
-      message: error.message,
-      details: error.details,
-      hint: error.hint,
-      code: error.code
-    });
+    logSupabaseError("Supabase comments load failed:", error);
     return [];
   }
 
-  return (data ?? []).map((comment) => dbCommentToPost(comment));
-}
+  if (likesResult.error) {
+    logSupabaseError("Supabase comment_likes load failed:", likesResult.error);
+  }
 
-function findSupabaseWeekId(week, supabaseWeeks) {
-  if (!week) return null;
-  const match = supabaseWeeks.find((row) => (
-    row.week_number === week.weekNumber ||
-    row.weekNumber === week.weekNumber ||
-    row.number === week.weekNumber ||
-    row.name === `Week ${week.weekNumber}` ||
-    row.title === `Week ${week.weekNumber}` ||
-    row.start === week.start.toISOString().slice(0, 10) ||
-    row.start_date === week.start.toISOString().slice(0, 10)
-  ));
-  return match?.id ?? null;
+  const comments = data ?? [];
+  const commentLikes = likesResult.data ?? [];
+  const repliesByParent = comments.reduce((acc, comment) => {
+    if (!comment.parent_comment_id) return acc;
+    const localMemberId = memberUuidToLocalId(comment.member_id, supabaseMembers);
+    const reply = {
+      id: comment.id,
+      memberId: localMemberId,
+      memberUuid: comment.member_id,
+      text: comment.content ?? "",
+      ts: comment.created_at ? new Date(comment.created_at).getTime() : Date.now(),
+    };
+    acc[comment.parent_comment_id] = [...(acc[comment.parent_comment_id] ?? []), reply];
+    return acc;
+  }, {});
+
+  return comments
+    .filter((comment) => !comment.parent_comment_id)
+    .map((comment) => dbCommentToPost(comment, commentLikes, repliesByParent[comment.id] ?? [], supabaseMembers));
 }
 
 /* ============================== SMALL UI ATOMS ============================== */
@@ -735,7 +930,7 @@ function timeAgo(ts) {
   return `${Math.floor(hr / 24)}d ago`;
 }
 
-function TeamPulse({ posts, setPosts, currentMemberId, setCurrentMemberId, currentWeekId, memberIdByLocalId, reloadComments }) {
+function TeamPulse({ posts, currentMemberId, setCurrentMemberId, currentWeekId, memberIdByLocalId, reloadComments }) {
   const [text, setText] = useState("");
   const [replyingTo, setReplyingTo] = useState(null);
   const [replyText, setReplyText] = useState("");
@@ -777,36 +972,118 @@ function TeamPulse({ posts, setPosts, currentMemberId, setCurrentMemberId, curre
     setText("");
     await reloadComments();
   }
-  function react(postId, emoji) {
-    setPosts(posts.map((p) => {
-      if (p.id !== postId) return p;
-      const list = p.reactions[emoji] || [];
-      const has = list.includes(currentMemberId);
-      return { ...p, reactions: { ...p.reactions, [emoji]: has ? list.filter((m) => m !== currentMemberId) : [...list, currentMemberId] } };
-    }));
+  async function react(postId, emoji) {
+    if (emoji !== "👍") {
+      alert("This database supports one shared like type for now.");
+      return;
+    }
+
+    const selectedMemberId = memberIdByLocalId[currentMemberId] ?? null;
+    if (!selectedMemberId) {
+      alert("Comment was not liked: selected member is not linked to Supabase.");
+      return;
+    }
+
+    const existing = await supabase
+      .from("comment_likes")
+      .select("id")
+      .eq("comment_id", postId)
+      .eq("member_id", selectedMemberId)
+      .maybeSingle();
+
+    if (existing.error) {
+      logSupabaseError("Supabase comment like lookup failed:", existing.error);
+      alert(`Comment like was not saved: ${existing.error.message}`);
+      return;
+    }
+
+    if (existing.data?.id) {
+      const { error } = await supabase.from("comment_likes").delete().eq("id", existing.data.id);
+      if (error) {
+        logSupabaseError("Supabase comment unlike failed:", error);
+        alert(`Comment like was not removed: ${error.message}`);
+        return;
+      }
+    } else {
+      const { error } = await supabase
+        .from("comment_likes")
+        .insert({ comment_id: postId, member_id: selectedMemberId });
+
+      if (error) {
+        logSupabaseError("Supabase comment like insert failed:", error);
+        alert(`Comment like was not saved: ${error.message}`);
+        return;
+      }
+    }
+
+    await reloadComments();
   }
-  function togglePin(postId) {
-    setPosts(posts.map((p) => (p.id === postId ? { ...p, pinned: !p.pinned } : p)));
+
+  async function togglePin(postId) {
+    const post = posts.find((p) => p.id === postId);
+    const { error } = await supabase
+      .from("comments")
+      .update({ is_pinned: !post?.pinned })
+      .eq("id", postId);
+
+    if (error) {
+      logSupabaseError("Supabase comment pin update failed:", error);
+      alert(`Comment pin was not saved: ${error.message}`);
+      return;
+    }
+
+    await reloadComments();
   }
+
   async function removePost(postId) {
+    const deleteLikes = await supabase.from("comment_likes").delete().eq("comment_id", postId);
+    if (deleteLikes.error) {
+      logSupabaseError("Supabase comment likes delete failed:", deleteLikes.error);
+      alert(`Comment was not deleted: ${deleteLikes.error.message}`);
+      return;
+    }
+
+    const deleteReplies = await supabase.from("comments").delete().eq("parent_comment_id", postId);
+    if (deleteReplies.error) {
+      logSupabaseError("Supabase comment replies delete failed:", deleteReplies.error);
+      alert(`Comment was not deleted: ${deleteReplies.error.message}`);
+      return;
+    }
+
     const { error } = await supabase.from("comments").delete().eq("id", postId);
     if (error) {
-      console.error("Supabase comment delete failed:", {
-        message: error.message,
-        details: error.details,
-        hint: error.hint,
-        code: error.code
-      });
+      logSupabaseError("Supabase comment delete failed:", error);
       alert(`Comment was not deleted: ${error.message}`);
       return;
     }
     await reloadComments();
   }
-  function submitReply(postId) {
-    if (!replyText.trim()) return;
-    setPosts(posts.map((p) => (p.id === postId ? { ...p, replies: [...p.replies, { id: `r${Date.now()}`, memberId: currentMemberId, text: replyText.trim(), ts: Date.now() }] } : p)));
+
+  async function submitReply(postId, event) {
+    event?.preventDefault();
+    const text = replyText.trim();
+    if (!text) return;
+
+    const selectedMemberId = memberIdByLocalId[currentMemberId] ?? null;
+    const { error } = await supabase
+      .from("comments")
+      .insert({
+        content: text,
+        member_id: selectedMemberId || null,
+        week_id: currentWeekId || null,
+        task_id: null,
+        parent_comment_id: postId,
+      });
+
+    if (error) {
+      logSupabaseError("Supabase comment reply insert failed:", error);
+      alert(`Reply was not saved: ${error.message}`);
+      return;
+    }
+
     setReplyText("");
     setReplyingTo(null);
+    await reloadComments();
   }
 
   return (
@@ -866,11 +1143,15 @@ function TeamPulse({ posts, setPosts, currentMemberId, setCurrentMemberId, curre
                         dir="auto"
                         value={replyText}
                         onChange={(e) => setReplyText(e.target.value)}
-                        onKeyDown={(e) => e.key === "Enter" && submitReply(p.id)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            submitReply(p.id, e);
+                          }
+                        }}
                         placeholder="Write a reply..."
                         className="flex-1 text-xs rounded-lg border border-slate-200 px-2.5 py-1.5 focus:outline-none"
                       />
-                      <button onClick={() => submitReply(p.id)} className="text-xs font-semibold px-2 text-teal-600">Send</button>
+                      <button type="button" onClick={(event) => submitReply(p.id, event)} className="text-xs font-semibold px-2 text-teal-600">Send</button>
                     </div>
                   )}
                 </div>
@@ -1123,6 +1404,12 @@ function MeetingCard({ meeting, setMeeting }) {
   const [when, setWhen] = useState(meeting.when);
   const [agenda, setAgenda] = useState(meeting.agenda);
 
+  useEffect(() => {
+    setLink(meeting.link);
+    setWhen(meeting.when);
+    setAgenda(meeting.agenda);
+  }, [meeting]);
+
   return (
     <div className="rounded-2xl p-4 flex flex-col gap-2" style={{ background: "linear-gradient(120deg,#0EA5E9,#22C55E)" }}>
       <div className="flex items-center justify-between">
@@ -1157,7 +1444,10 @@ function MeetingCard({ meeting, setMeeting }) {
               <input value={agenda} onChange={(e) => setAgenda(e.target.value)} className="w-full mt-1 rounded-xl border border-slate-200 px-3 py-2 text-sm" placeholder="Review Section 2.2 draft" />
             </div>
             <button
-              onClick={() => { setMeeting({ link, when, agenda }); setEditing(false); }}
+              onClick={async () => {
+                const saved = await setMeeting({ link, when, agenda });
+                if (saved) setEditing(false);
+              }}
               className="rounded-xl py-2.5 font-bold text-white"
               style={{ background: "linear-gradient(90deg,#0EA5E9,#22C55E)" }}
             >
@@ -1265,32 +1555,96 @@ function DevPanel({ simDate, setSimDate, show, setShow }) {
 /* ============================== MAIN APP ============================== */
 
 export default function HawkimTrack() {
-  const weeks = useMemo(() => buildWeeks(), []);
+  const fallbackWeeks = useMemo(() => buildWeeks(), []);
+  const [weeks, setWeeks] = useState(fallbackWeeks);
   const [activeTab, setActiveTab] = useState("Week Plan");
-  const [taskOverrides, setTaskOverrides] = useState(() => loadLS(LS_KEYS.tasks, {}));
   const [pulsePosts, setPulsePosts] = useState([]);
   const [currentMemberId, setCurrentMemberId] = useState(MEMBERS[0].id);
-  const [weeklyStars, setWeeklyStars] = useState(() => loadLS(LS_KEYS.stars, {}));
-  const [weeklyReviews, setWeeklyReviews] = useState(() => loadLS(LS_KEYS.reviews, {}));
-  const [meeting, setMeeting] = useState(() => loadLS(LS_KEYS.meeting, { link: "", when: "Saturday, 6:00 PM", agenda: "" }));
+  const [weeklyStars, setWeeklyStars] = useState({});
+  const [weeklyReviews, setWeeklyReviews] = useState({});
+  const [meeting, setMeeting] = useState(DEFAULT_MEETING);
   const [simDate, setSimDate] = useState(() => loadLS(LS_KEYS.simDate, ""));
   const [supabaseMembers, setSupabaseMembers] = useState([]);
-  const [supabaseWeeks, setSupabaseWeeks] = useState([]);
+  const [appSettings, setAppSettings] = useState(null);
+  const [sharedSettings, setSharedSettings] = useState({});
   const [showDev, setShowDev] = useState(false);
   const [showStarModal, setShowStarModal] = useState(false);
   const [showReviewModal, setShowReviewModal] = useState(false);
   const [celebrate, setCelebrate] = useState(0);
 
-  useEffect(() => saveLS(LS_KEYS.tasks, taskOverrides), [taskOverrides]);
-  useEffect(() => saveLS(LS_KEYS.stars, weeklyStars), [weeklyStars]);
-  useEffect(() => saveLS(LS_KEYS.reviews, weeklyReviews), [weeklyReviews]);
-  useEffect(() => saveLS(LS_KEYS.meeting, meeting), [meeting]);
   useEffect(() => saveLS(LS_KEYS.simDate, simDate), [simDate]);
 
-  const reloadComments = useCallback(async () => {
-    const nextComments = await loadCommentsFromSupabase();
+  const memberIdByLocalId = useMemo(() => {
+    return MEMBERS.reduce((acc, member) => {
+      const dbMember = supabaseMembers.find((row) => row.name?.toLowerCase() === member.name.toLowerCase());
+      acc[member.id] = dbMember?.id ?? null;
+      return acc;
+    }, {});
+  }, [supabaseMembers]);
+
+  const reloadComments = useCallback(async (members = supabaseMembers) => {
+    const nextComments = await loadCommentsFromSupabase(members);
     setPulsePosts(nextComments);
-  }, []);
+  }, [supabaseMembers]);
+
+  const loadWeeksAndTasks = useCallback(async () => {
+    const weeksResult = await supabase
+      .from("weeks")
+      .select("*")
+      .order("week_number", { ascending: true });
+
+    if (weeksResult.error) {
+      logSupabaseError("Supabase weeks load failed:", weeksResult.error);
+      alert(`Weeks were not loaded: ${weeksResult.error.message}`);
+      return;
+    }
+
+    const dbWeeks = await seedWeeksIfEmpty(weeksResult.data ?? [], fallbackWeeks);
+
+    const tasksResult = await supabase
+      .from("tasks")
+      .select("*")
+      .order("sort_order", { ascending: true });
+
+    if (tasksResult.error) {
+      logSupabaseError("Supabase tasks load failed:", tasksResult.error);
+      alert(`Tasks were not loaded: ${tasksResult.error.message}`);
+      setWeeks(mergeDbWeeks(fallbackWeeks, dbWeeks, []));
+      return;
+    }
+
+    const dbTasks = await seedTasksIfEmpty(tasksResult.data ?? [], fallbackWeeks, dbWeeks);
+    setWeeks(mergeDbWeeks(fallbackWeeks, dbWeeks, dbTasks));
+  }, [fallbackWeeks]);
+
+  const loadSettings = useCallback(async (members = supabaseMembers) => {
+    const { data, error } = await supabase
+      .from("app_settings")
+      .select("*")
+      .eq("id", 1)
+      .maybeSingle();
+
+    if (error) {
+      logSupabaseError("Supabase app_settings load failed:", error);
+      alert(`Settings were not loaded: ${error.message}`);
+      return;
+    }
+
+    const nextSharedSettings = parseSharedSettings(data);
+    setAppSettings(data ?? null);
+    setSharedSettings(nextSharedSettings);
+    setMeeting(nextSharedSettings.meeting ?? DEFAULT_MEETING);
+    setWeeklyReviews(nextSharedSettings.weeklyReviews ?? {});
+
+    const bestLocalMemberId = memberUuidToLocalId(data?.best_member_id, members);
+    const star = data?.best_member_id ? {
+      memberId: bestLocalMemberId,
+      badgeId: nextSharedSettings.starBadgeId ?? BADGES[0].id,
+      message: nextSharedSettings.starMessage ?? "",
+    } : null;
+
+    setWeeklyStars(star ? { global: star } : {});
+  }, [supabaseMembers]);
 
   useEffect(() => {
     let mounted = true;
@@ -1312,89 +1666,172 @@ export default function HawkimTrack() {
         });
       }
 
-      const [membersResult, weeksResult, comments] = await Promise.all([
+      const [membersResult] = await Promise.all([
         supabase.from("team_members").select("id, name"),
-        supabase.from("weeks").select("*"),
-        loadCommentsFromSupabase()
       ]);
 
       if (membersResult.error) {
-        console.error("Supabase team_members load failed:", {
-          message: membersResult.error.message,
-          details: membersResult.error.details,
-          hint: membersResult.error.hint,
-          code: membersResult.error.code
-        });
-      }
-
-      if (weeksResult.error) {
-        console.error("Supabase weeks load failed:", {
-          message: weeksResult.error.message,
-          details: weeksResult.error.details,
-          hint: weeksResult.error.hint,
-          code: weeksResult.error.code
-        });
+        logSupabaseError("Supabase team_members load failed:", membersResult.error);
+        alert(`Team members were not loaded: ${membersResult.error.message}`);
       }
 
       if (!mounted) return;
-      setSupabaseMembers(membersResult.data ?? []);
-      setSupabaseWeeks(weeksResult.data ?? []);
-      setPulsePosts(comments);
+      const members = membersResult.data ?? [];
+      setSupabaseMembers(members);
+      await Promise.all([
+        loadWeeksAndTasks(),
+        loadSettings(members),
+        reloadComments(members),
+      ]);
     }
 
     loadSupabaseData();
 
     const channel = supabase
-      .channel("public:comments")
+      .channel("hawkim-dashboard-live")
+      .on("postgres_changes", { event: "*", schema: "public", table: "tasks" }, () => {
+        loadWeeksAndTasks();
+      })
+      .on("postgres_changes", { event: "*", schema: "public", table: "weeks" }, () => {
+        loadWeeksAndTasks();
+      })
       .on("postgres_changes", { event: "*", schema: "public", table: "comments" }, () => {
         reloadComments();
       })
-      .subscribe();
+      .on("postgres_changes", { event: "*", schema: "public", table: "comment_likes" }, () => {
+        reloadComments();
+      })
+      .on("postgres_changes", { event: "*", schema: "public", table: "app_settings" }, () => {
+        loadSettings();
+      })
+      .subscribe((status, error) => {
+        console.log("Dashboard realtime status:", status);
+
+        if (error) {
+          console.error("Dashboard realtime error:", error);
+        }
+      });
 
     return () => {
       mounted = false;
       supabase.removeChannel(channel);
     };
-  }, [reloadComments]);
+  }, [loadSettings, loadWeeksAndTasks, reloadComments]);
 
   const today = simDate ? new Date(simDate + "T12:00:00") : new Date();
 
   const activeIdx = findActiveWeekIndex(weeks, today);
   const currentWeek = activeIdx >= 0 ? weeks[activeIdx] : null;
-  const currentWeekId = useMemo(() => findSupabaseWeekId(currentWeek, supabaseWeeks), [currentWeek, supabaseWeeks]);
-  const memberIdByLocalId = useMemo(() => {
-    return MEMBERS.reduce((acc, member) => {
-      const dbMember = supabaseMembers.find((row) => row.name?.toLowerCase() === member.name.toLowerCase());
-      acc[member.id] = dbMember?.id ?? null;
-      return acc;
-    }, {});
-  }, [supabaseMembers]);
+  const currentWeekId = currentWeek?.id ?? appSettings?.current_week_id ?? null;
+  const currentStar = weeklyStars.global ?? null;
 
   const overallPct = useMemo(() => {
     let total = 0, done = 0;
     weeks.forEach((w) => {
       [...w.tasks, ...w.parallelTasks, ...w.deliverables].forEach((item) => {
         total += item.weight;
-        const status = taskOverrides[item.id]?.status ?? item.status;
+        const status = item.status;
         if (status === "Completed") done += item.weight;
       });
     });
     return total === 0 ? 0 : Math.round((done / total) * 100);
-  }, [weeks, taskOverrides]);
+  }, [weeks]);
 
-  const handleCycle = useCallback((itemId, currentStatus) => {
+  const handleCycle = useCallback(async (itemId, currentStatus) => {
     const next = ITEM_STATUS_CYCLE[(ITEM_STATUS_CYCLE.indexOf(currentStatus) + 1) % ITEM_STATUS_CYCLE.length];
-    setTaskOverrides((prev) => {
-      const updated = { ...prev, [itemId]: { status: next } };
-      // check if this completes the whole current week
-      if (currentWeek && next === "Completed") {
-        const all = [...currentWeek.tasks, ...currentWeek.parallelTasks, ...currentWeek.deliverables];
-        const allDone = all.every((it) => (it.id === itemId ? true : (updated[it.id]?.status ?? it.status) === "Completed"));
-        if (allDone) setCelebrate((c) => c + 1);
-      }
-      return updated;
-    });
-  }, [currentWeek]);
+    const { error } = await supabase
+      .from("tasks")
+      .update({
+        status: uiStatusToDb(next),
+        completed_at: next === "Completed" ? new Date().toISOString() : null,
+      })
+      .eq("id", itemId)
+      .select()
+      .single();
+
+    if (error) {
+      logSupabaseError("Supabase task status update failed:", error);
+      alert(`Task was not updated: ${error.message}`);
+      return;
+    }
+
+    await loadWeeksAndTasks();
+
+    if (currentWeek && next === "Completed") {
+      const all = [...currentWeek.tasks, ...currentWeek.parallelTasks, ...currentWeek.deliverables];
+      const allDone = all.every((it) => (it.id === itemId ? true : it.status === "Completed"));
+      if (allDone) setCelebrate((c) => c + 1);
+    }
+  }, [currentWeek, loadWeeksAndTasks]);
+
+  const saveWeeklyStar = useCallback(async (star) => {
+    const bestMemberId = memberIdByLocalId[star.memberId] ?? null;
+    if (!bestMemberId) {
+      alert("Weekly Star was not saved: selected member is not linked to Supabase.");
+      return;
+    }
+
+    const { error } = await supabase
+      .from("app_settings")
+      .update({
+        best_member_id: bestMemberId,
+        announcement: buildSharedSettingsPayload(sharedSettings, {
+          starBadgeId: star.badgeId,
+          starMessage: star.message,
+        }),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", 1);
+
+    if (error) {
+      logSupabaseError("Supabase weekly star update failed:", error);
+      alert(`Weekly Star was not saved: ${error.message}`);
+      return;
+    }
+
+    setShowStarModal(false);
+    await loadSettings();
+  }, [loadSettings, memberIdByLocalId, sharedSettings]);
+
+  const saveWeeklyReview = useCallback(async (form) => {
+    if (!currentWeek) return;
+    const nextReviews = { ...weeklyReviews, [currentWeek.id]: form };
+    const { error } = await supabase
+      .from("app_settings")
+      .update({
+        announcement: buildSharedSettingsPayload(sharedSettings, { weeklyReviews: nextReviews }),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", 1);
+
+    if (error) {
+      logSupabaseError("Supabase weekly review update failed:", error);
+      alert(`Weekly Review was not saved: ${error.message}`);
+      return;
+    }
+
+    setShowReviewModal(false);
+    await loadSettings();
+  }, [currentWeek, loadSettings, sharedSettings, weeklyReviews]);
+
+  const saveMeeting = useCallback(async (nextMeeting) => {
+    const { error } = await supabase
+      .from("app_settings")
+      .update({
+        announcement: buildSharedSettingsPayload(sharedSettings, { meeting: nextMeeting }),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", 1);
+
+    if (error) {
+      logSupabaseError("Supabase meeting settings update failed:", error);
+      alert(`Meeting settings were not saved: ${error.message}`);
+      return false;
+    }
+
+    await loadSettings();
+    return true;
+  }, [loadSettings, sharedSettings]);
 
   const daysUntilStart = activeIdx === -1 ? Math.max(1, daysBetween(new Date(today), new Date(PLAN_START))) : 0;
 
@@ -1411,28 +1848,27 @@ export default function HawkimTrack() {
               <CurrentWeekCard
                 week={currentWeek}
                 today={today}
-                taskOverrides={taskOverrides}
+                taskOverrides={{}}
                 onCycle={handleCycle}
                 onOpenReview={() => setShowReviewModal(true)}
                 celebrate={celebrate}
               />
-              <WeeklyStarCard weekId={currentWeek.id} star={weeklyStars[currentWeek.id]} onEdit={() => setShowStarModal(true)} />
+              <WeeklyStarCard weekId={currentWeek.id} star={currentStar} onEdit={() => setShowStarModal(true)} />
             </div>
           )}
 
           <div className="mt-4">
             <h3 className="text-sm font-bold text-slate-500 mb-2 flex items-center gap-1.5"><TrendingUp size={15}/> Progress</h3>
             <div className="grid lg:grid-cols-[1fr_320px] gap-4 items-stretch">
-              <ProgressChart weeks={weeks} taskOverrides={taskOverrides} />
+              <ProgressChart weeks={weeks} taskOverrides={{}} />
               <div className="flex flex-col gap-4">
                 {currentWeek ? (
-                  <ProgressBars week={currentWeek} overallPct={overallPct} taskOverrides={taskOverrides} />
+                  <ProgressBars week={currentWeek} overallPct={overallPct} taskOverrides={{}} />
                 ) : (
                   <div className="rounded-2xl bg-white border border-slate-100 p-4 text-xs text-slate-400 italic">No active week to show weekly progress for.</div>
                 )}
                 <TeamPulse
                   posts={pulsePosts}
-                  setPosts={setPulsePosts}
                   currentMemberId={currentMemberId}
                   setCurrentMemberId={setCurrentMemberId}
                   currentWeekId={currentWeekId}
@@ -1444,21 +1880,21 @@ export default function HawkimTrack() {
           </div>
 
           <div className="mt-4">
-            <MeetingCard meeting={meeting} setMeeting={setMeeting} />
+            <MeetingCard meeting={meeting} setMeeting={saveMeeting} />
           </div>
         </div>
       )}
 
       {activeTab === "Plan Details" && (
-        <PlanDetailsView weeks={weeks} today={today} taskOverrides={taskOverrides} weeklyReviews={weeklyReviews} />
+        <PlanDetailsView weeks={weeks} today={today} taskOverrides={{}} weeklyReviews={weeklyReviews} />
       )}
 
       {showStarModal && currentWeek && (
         <StarModal
           weekNumber={currentWeek.weekNumber}
-          current={weeklyStars[currentWeek.id]}
+          current={currentStar}
           onClose={() => setShowStarModal(false)}
-          onSave={(star) => { setWeeklyStars({ ...weeklyStars, [currentWeek.id]: star }); setShowStarModal(false); }}
+          onSave={saveWeeklyStar}
         />
       )}
 
@@ -1467,7 +1903,7 @@ export default function HawkimTrack() {
           weekNumber={currentWeek.weekNumber}
           existing={weeklyReviews[currentWeek.id]}
           onClose={() => setShowReviewModal(false)}
-          onSave={(form) => { setWeeklyReviews({ ...weeklyReviews, [currentWeek.id]: form }); setShowReviewModal(false); }}
+          onSave={saveWeeklyReview}
         />
       )}
 
