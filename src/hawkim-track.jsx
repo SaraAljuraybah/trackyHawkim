@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from "react";
+import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend,
 } from "recharts";
@@ -384,6 +384,8 @@ const DB_TO_UI_STATUS = {
 };
 
 const DEFAULT_MEETING = { link: "", when: "Saturday, 6:00 PM", agenda: "" };
+let seedWeeksPromise = null;
+let seedTasksPromise = null;
 
 function logSupabaseError(label, error) {
   console.error(label, {
@@ -461,7 +463,14 @@ function mergeDbWeeks(rawWeeks, dbWeeks, dbTasks) {
       title: dbWeek.title,
     } : fallbackWeek;
 
-    if (!dbWeek) return base;
+    if (!dbWeek) {
+      return {
+        ...fallbackWeek,
+        tasks: [],
+        parallelTasks: [],
+        deliverables: [],
+      };
+    }
 
     const grouped = { tasks: [], parallelTasks: [], deliverables: [] };
     dbTasks
@@ -481,8 +490,29 @@ function mergeDbWeeks(rawWeeks, dbWeeks, dbTasks) {
   });
 }
 
+function emptyTaskWeeks(rawWeeks) {
+  return rawWeeks.map((week) => ({
+    ...week,
+    tasks: [],
+    parallelTasks: [],
+    deliverables: [],
+  }));
+}
+
+function totalTaskCount(weeks) {
+  return weeks.reduce((total, week) => (
+    total + week.tasks.length + week.parallelTasks.length + week.deliverables.length
+  ), 0);
+}
+
 async function seedWeeksIfEmpty(existingWeeks, rawWeeks) {
   if (existingWeeks.length > 0) return existingWeeks;
+  if (seedWeeksPromise) return seedWeeksPromise;
+
+  console.log("[tasks-debug] seedWeeksIfEmpty runs", {
+    existingWeeks: existingWeeks.length,
+  });
+
   const rows = rawWeeks.map((week) => ({
     week_number: week.weekNumber,
     title: `Week ${week.weekNumber}`,
@@ -490,27 +520,37 @@ async function seedWeeksIfEmpty(existingWeeks, rawWeeks) {
     end_date: week.end.toISOString().slice(0, 10),
   }));
 
-  const { data, error } = await supabase
-    .from("weeks")
-    .insert(rows)
-    .select("*");
+  seedWeeksPromise = (async () => {
+    const { data, error } = await supabase
+      .from("weeks")
+      .insert(rows)
+      .select("*");
 
-  if (error) {
-    logSupabaseError("Supabase weeks seed failed:", error);
-    alert(`Weeks were not initialized: ${error.message}`);
-    return existingWeeks;
-  }
+    if (error) {
+      logSupabaseError("Supabase weeks seed failed:", error);
+      alert(`Weeks were not initialized: ${error.message}`);
+      return existingWeeks;
+    }
 
-  return data ?? [];
+    return data ?? [];
+  })();
+
+  return seedWeeksPromise;
 }
 
 async function seedTasksIfEmpty(existingTasks, rawWeeks, dbWeeks) {
-  if (existingTasks.length > 0) return existingTasks;
+  if (seedTasksPromise) return seedTasksPromise;
 
   const rows = [];
+  const missingWeekIds = [];
   rawWeeks.forEach((week) => {
     const dbWeek = dbWeeks.find((w) => Number(w.week_number) === week.weekNumber);
     if (!dbWeek) return;
+
+    const existingTasksForWeek = existingTasks.filter((task) => task.week_id === dbWeek.id);
+    if (existingTasksForWeek.length > 0) return;
+    missingWeekIds.push(dbWeek.id);
+
     [
       ["tasks", week.tasks, TASK_KIND_SORT_OFFSET.tasks],
       ["parallelTasks", week.parallelTasks, TASK_KIND_SORT_OFFSET.parallel],
@@ -533,18 +573,72 @@ async function seedTasksIfEmpty(existingTasks, rawWeeks, dbWeeks) {
 
   if (rows.length === 0) return existingTasks;
 
-  const { data, error } = await supabase
-    .from("tasks")
-    .insert(rows)
-    .select("*");
+  console.log("[tasks-debug] seedTasksIfEmpty runs", {
+    existingTasks: existingTasks.length,
+    insertingRows: rows.length,
+  });
 
-  if (error) {
-    logSupabaseError("Supabase tasks seed failed:", error);
-    alert(`Tasks were not initialized: ${error.message}`);
-    return existingTasks;
-  }
+  seedTasksPromise = (async () => {
+    const recheck = await supabase
+      .from("tasks")
+      .select("id, week_id")
+      .in("week_id", missingWeekIds);
 
-  return data ?? [];
+    if (recheck.error) {
+      logSupabaseError("Supabase tasks seed recheck failed:", recheck.error);
+      return existingTasks;
+    }
+
+    const recheckedWeekIds = new Set((recheck.data ?? []).map((task) => task.week_id));
+    const safeRows = rows.filter((row) => !recheckedWeekIds.has(row.week_id));
+
+    if (safeRows.length === 0) {
+      console.log("[tasks-debug] seedTasksIfEmpty skipped after per-week recheck", {
+        recheckRows: recheck.data?.length ?? 0,
+      });
+      const latest = await supabase
+        .from("tasks")
+        .select("*")
+        .order("sort_order", { ascending: true });
+
+      if (latest.error) {
+        logSupabaseError("Supabase tasks reload after seed recheck failed:", latest.error);
+        return existingTasks;
+      }
+
+      return latest.data ?? [];
+    }
+
+    const { data, error } = await supabase
+      .from("tasks")
+      .insert(safeRows)
+      .select("*");
+
+    if (error) {
+      logSupabaseError("Supabase tasks seed failed:", error);
+      alert(`Tasks were not initialized: ${error.message}`);
+      return existingTasks;
+    }
+
+    console.log("[tasks-debug] seedTasksIfEmpty inserted rows", {
+      inserted: data?.length ?? 0,
+      ids: (data ?? []).map((task) => task.id),
+    });
+
+    const latest = await supabase
+      .from("tasks")
+      .select("*")
+      .order("sort_order", { ascending: true });
+
+    if (latest.error) {
+      logSupabaseError("Supabase tasks reload after seed insert failed:", latest.error);
+      return [...existingTasks, ...(data ?? [])];
+    }
+
+    return latest.data ?? [];
+  })();
+
+  return seedTasksPromise;
 }
 
 function dbCommentToPost(comment, commentLikes, replies, supabaseMembers, fallbackMemberId = MEMBERS[0].id) {
@@ -1556,7 +1650,7 @@ function DevPanel({ simDate, setSimDate, show, setShow }) {
 
 export default function HawkimTrack() {
   const fallbackWeeks = useMemo(() => buildWeeks(), []);
-  const [weeks, setWeeks] = useState(fallbackWeeks);
+  const [weeks, setWeeks] = useState(() => emptyTaskWeeks(fallbackWeeks));
   const [activeTab, setActiveTab] = useState("Week Plan");
   const [pulsePosts, setPulsePosts] = useState([]);
   const [currentMemberId, setCurrentMemberId] = useState(MEMBERS[0].id);
@@ -1567,6 +1661,7 @@ export default function HawkimTrack() {
   const [supabaseMembers, setSupabaseMembers] = useState([]);
   const [appSettings, setAppSettings] = useState(null);
   const [sharedSettings, setSharedSettings] = useState({});
+  const supabaseMembersRef = useRef([]);
   const [showDev, setShowDev] = useState(false);
   const [showStarModal, setShowStarModal] = useState(false);
   const [showReviewModal, setShowReviewModal] = useState(false);
@@ -1582,12 +1677,14 @@ export default function HawkimTrack() {
     }, {});
   }, [supabaseMembers]);
 
-  const reloadComments = useCallback(async (members = supabaseMembers) => {
+  const reloadComments = useCallback(async (members = supabaseMembersRef.current) => {
     const nextComments = await loadCommentsFromSupabase(members);
     setPulsePosts(nextComments);
-  }, [supabaseMembers]);
+  }, []);
 
   const loadWeeksAndTasks = useCallback(async () => {
+    console.log("[tasks-debug] loadWeeksAndTasks starts");
+
     const weeksResult = await supabase
       .from("weeks")
       .select("*")
@@ -1606,18 +1703,37 @@ export default function HawkimTrack() {
       .select("*")
       .order("sort_order", { ascending: true });
 
+    console.log("[tasks-debug] Supabase tasks returned", {
+      count: tasksResult.data?.length ?? 0,
+      ids: (tasksResult.data ?? []).map((task) => task.id),
+    });
+
     if (tasksResult.error) {
       logSupabaseError("Supabase tasks load failed:", tasksResult.error);
       alert(`Tasks were not loaded: ${tasksResult.error.message}`);
-      setWeeks(mergeDbWeeks(fallbackWeeks, dbWeeks, []));
+      setWeeks((previousWeeks) => {
+        const nextWeeks = mergeDbWeeks(fallbackWeeks, dbWeeks, []);
+        console.log("[tasks-debug] setWeeks after failed task load", {
+          before: totalTaskCount(previousWeeks),
+          after: totalTaskCount(nextWeeks),
+        });
+        return nextWeeks;
+      });
       return;
     }
 
     const dbTasks = await seedTasksIfEmpty(tasksResult.data ?? [], fallbackWeeks, dbWeeks);
-    setWeeks(mergeDbWeeks(fallbackWeeks, dbWeeks, dbTasks));
+    setWeeks((previousWeeks) => {
+      const nextWeeks = mergeDbWeeks(fallbackWeeks, dbWeeks, dbTasks);
+      console.log("[tasks-debug] setWeeks replace after loadWeeksAndTasks", {
+        before: totalTaskCount(previousWeeks),
+        after: totalTaskCount(nextWeeks),
+      });
+      return nextWeeks;
+    });
   }, [fallbackWeeks]);
 
-  const loadSettings = useCallback(async (members = supabaseMembers) => {
+  const loadSettings = useCallback(async (members = supabaseMembersRef.current) => {
     const { data, error } = await supabase
       .from("app_settings")
       .select("*")
@@ -1644,7 +1760,7 @@ export default function HawkimTrack() {
     } : null;
 
     setWeeklyStars(star ? { global: star } : {});
-  }, [supabaseMembers]);
+  }, []);
 
   useEffect(() => {
     let mounted = true;
@@ -1677,6 +1793,7 @@ export default function HawkimTrack() {
 
       if (!mounted) return;
       const members = membersResult.data ?? [];
+      supabaseMembersRef.current = members;
       setSupabaseMembers(members);
       await Promise.all([
         loadWeeksAndTasks(),
@@ -1689,7 +1806,11 @@ export default function HawkimTrack() {
 
     const channel = supabase
       .channel("hawkim-dashboard-live")
-      .on("postgres_changes", { event: "*", schema: "public", table: "tasks" }, () => {
+      .on("postgres_changes", { event: "*", schema: "public", table: "tasks" }, (payload) => {
+        console.log("[tasks-debug] realtime task event fires", {
+          eventType: payload.eventType,
+          id: payload.new?.id ?? payload.old?.id,
+        });
         loadWeeksAndTasks();
       })
       .on("postgres_changes", { event: "*", schema: "public", table: "weeks" }, () => {
